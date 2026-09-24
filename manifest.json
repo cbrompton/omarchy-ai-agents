@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "cbrompton.ai-agents",
+  "id": "ai-agents",
   "name": "AI Agents",
   "version": "1.0.0",
   "author": "cbrompton",
@@ -15,7 +15,7 @@
     "displayName": "AI Agents",
     "description": "Rate-limit meters with pace, tokens by day and by model, and a switch for which Claude account the CLI is signed into.",
     "category": "AI",
-    "aliases": ["ai-agents", "agents", "usage", "claude-account"],
+    "aliases": ["agents", "usage", "claude-account"],
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {

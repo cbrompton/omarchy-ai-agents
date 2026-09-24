@@ -35,10 +35,10 @@ Optional extras:
 omarchy pkg aur add ai-usagebar
 
 # Put the account switcher on your PATH (the panel finds it without this)
-ln -sf ~/.config/omarchy/plugins/cbrompton.ai-agents/bin/omarchy-claude-account ~/.local/bin/
+ln -sf ~/.config/omarchy/plugins/ai-agents/bin/omarchy-claude-account ~/.local/bin/
 ```
 
-Update with `omarchy plugin update cbrompton.ai-agents`.
+Update with `omarchy plugin update ai-agents`.
 
 ### Requirements
 
@@ -125,7 +125,7 @@ last one is refused because it could not be saved before being replaced —
 Accounts are registered from a terminal; the panel only switches between them.
 The commands below assume you linked the helper onto your PATH (see Install).
 If you didn't, use the full path:
-`~/.config/omarchy/plugins/cbrompton.ai-agents/bin/omarchy-claude-account`.
+`~/.config/omarchy/plugins/ai-agents/bin/omarchy-claude-account`.
 
 Labels can use letters, digits, `.`, `_` and `-`.
 
@@ -193,7 +193,7 @@ their logins are untouched.
 - Bar icon: left = panel, right = launch agent, middle / scroll = next provider.
 - Panel: `h`/`l` switch provider, `j`/`k` scroll, `a` cycle Claude account,
   `r` or Enter refresh, Tab to the neighbouring panel, Esc closes.
-- IPC: `omarchy-shell cbrompton.ai-agents <open|close|toggle|refresh|next>`,
+- IPC: `omarchy-shell ai-agents <open|close|toggle|refresh|next>`,
   and `account <label>` to switch (or `account ""` to list).
 
 ## Settings
@@ -211,14 +211,14 @@ In this widget's entry in `~/.config/omarchy/shell.json`:
 | `syncMode` / `syncDir` / `syncFileName` / `syncDeviceId` | | Cross-device aggregation, as in `omarchy.agents` |
 
 ```bash
-omarchy bar set cbrompton.ai-agents refreshIntervalSec 300 --json
-omarchy bar set cbrompton.ai-agents showAll true --json
+omarchy bar set ai-agents refreshIntervalSec 300 --json
+omarchy bar set ai-agents showAll true --json
 ```
 
 Per-agent enablement is nested, so pass the whole object:
 
 ```bash
-omarchy bar set cbrompton.ai-agents providers '{
+omarchy bar set ai-agents providers '{
   "claude": { "enabled": true },
   "codex": { "enabled": true },
   "fireworks": { "enabled": false }
@@ -253,7 +253,7 @@ test/test-switch.py          exercises the credential move against a throwaway H
 ## Uninstall
 
 ```bash
-omarchy plugin remove cbrompton.ai-agents
+omarchy plugin remove ai-agents
 omarchy bar put omarchy.agents --section right   # bring the built-in back
 rm -f ~/.local/bin/omarchy-claude-account
 ```

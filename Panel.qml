@@ -19,8 +19,8 @@ import "Model.js" as Model
 // it, and long content shortens instead of painting past the edge.
 Panel {
   id: root
-  moduleName: "cbrompton.ai-agents"
-  ipcTarget: "cbrompton.ai-agents"
+  moduleName: "ai-agents"
+  ipcTarget: "ai-agents"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
