@@ -1,0 +1,822 @@
+#!/usr/bin/python3
+# omarchy:summary=Switch which Claude account the `claude` CLI is signed into
+# omarchy:args=status|list|add|switch|forget [LABEL] [--json]
+"""Move the `claude` CLI's one login between named accounts, on Linux.
+
+The CLI keeps exactly one default credential: `~/.claude/.credentials.json`,
+holding a *rotating* refresh token. Two clients pointed at copies of the same
+token invalidate each other the first time either refreshes, so an account is
+never copied here -- it is moved. The outgoing credential is captured into the
+login keyring under its own label before the incoming one takes the slot, and
+the incoming one is removed from the keyring once it is live. Exactly one copy
+of any lineage exists at any moment.
+
+That mirrors the design ai-usagebar's `cli_account.rs` documents and tests;
+only its storage backend is macOS-Keychain-only, which is why this exists.
+
+At rest, an inactive account is a secret in gnome-keyring (via secret-tool),
+not a file. The only plaintext credential on disk is the active one, at the
+path and mode Claude Code itself uses.
+
+The identity marker (`oauthAccount` in `~/.claude.json`: uuid, email, org --
+never a token) rides along with the switch so `claude` and every usage
+collector report the account that is actually live.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+KEYRING_ATTR = "omarchy-claude-account"
+# Keep a switch recoverable without keeping credentials around forever.
+BACKUP_RETENTION = 10
+
+
+def home() -> Path:
+    return Path(os.path.expanduser("~"))
+
+
+def claude_config_dir() -> Path:
+    """The live CLI config dir. CLAUDE_CONFIG_DIR wins, as it does for `claude`."""
+    return Path(os.path.expandvars(os.path.expanduser(
+        os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
+    )))
+
+
+def default_credentials_path() -> Path:
+    return claude_config_dir() / ".credentials.json"
+
+
+def claude_json_path() -> Path:
+    """`.claude.json` sits beside the config dir, not inside it."""
+    config = claude_config_dir()
+    if config == home() / ".claude":
+        return home() / ".claude.json"
+    return config.parent / ".claude.json"
+
+
+def state_root() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or str(home() / ".local/share")
+    return Path(base) / "omarchy" / "claude-accounts"
+
+
+def registry_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(home() / ".config")
+    return Path(base) / "omarchy" / "agents" / "claude-accounts.json"
+
+
+def backups_dir() -> Path:
+    return state_root() / "backups"
+
+
+# --------------------------------------------------------------- filesystem
+
+
+def secure_dir(path: Path) -> Path:
+    """Create a directory 0700, and secure the account root on the way down.
+
+    mkdir(parents=True) would leave the intermediate directories at the
+    default umask, so an account dir could sit 0700 inside a world-readable
+    parent. Only the tree this tool owns is tightened; $HOME and the XDG roots
+    above it are left alone.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    root = state_root()
+    if root.exists() and (path == root or root in path.parents):
+        os.chmod(root, 0o700)
+    return path
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write 0600 without ever exposing a readable window on the real path."""
+    secure_dir(path.parent)
+    handle, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w") as stream:
+            stream.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def read_text_or_none(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def load_json(path: Path, fallback: Any) -> Any:
+    raw = read_text_or_none(path)
+    if raw is None:
+        return fallback
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return fallback
+
+
+# ------------------------------------------------------------------ keyring
+
+
+class KeyringError(RuntimeError):
+    pass
+
+
+def secret_tool() -> str:
+    path = shutil.which("secret-tool")
+    if not path:
+        raise KeyringError(
+            "secret-tool is not installed. Install libsecret "
+            "(`omarchy pkg add libsecret`) so inactive accounts can be kept "
+            "encrypted in the login keyring."
+        )
+    return path
+
+
+def keyring_store(label: str, blob: str) -> None:
+    result = subprocess.run(
+        [secret_tool(), "store", "--label", f"Omarchy Claude account: {label}",
+         KEYRING_ATTR, label],
+        input=blob, text=True, capture_output=True,
+    )
+    if result.returncode != 0:
+        raise KeyringError(
+            f"could not store {label!r} in the login keyring: "
+            f"{result.stderr.strip() or 'secret-tool failed'}"
+        )
+
+
+def keyring_lookup(label: str) -> str | None:
+    result = subprocess.run(
+        [secret_tool(), "lookup", KEYRING_ATTR, label],
+        text=True, capture_output=True,
+    )
+    if result.returncode != 0:
+        # secret-tool exits non-zero both for "no such secret" and for a
+        # locked or absent keyring. Only the latter carries a message.
+        message = result.stderr.strip()
+        if message:
+            raise KeyringError(f"keyring unavailable: {message}")
+        return None
+    return result.stdout or None
+
+
+def keyring_clear(label: str) -> None:
+    subprocess.run(
+        [secret_tool(), "clear", KEYRING_ATTR, label],
+        text=True, capture_output=True,
+    )
+
+
+def keyring_available() -> tuple[bool, str]:
+    try:
+        keyring_lookup("__omarchy_probe__")
+        return True, ""
+    except KeyringError as error:
+        return False, str(error)
+
+
+# -------------------------------------------------------------- liveness
+
+
+def process_start_ticks(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat, read past the parenthesised comm.
+
+    comm can contain spaces and parentheses, so the fields are counted from
+    the last ')' rather than by splitting the whole line.
+    """
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    close = stat_line.rfind(")")
+    if close < 0:
+        return None
+    fields = stat_line[close + 2:].split()
+    # After comm, stat's field 3 (state) is index 0 here; field 22 is index 19.
+    return fields[19] if len(fields) > 19 else None
+
+
+def live_sessions() -> list[dict]:
+    """Claude CLI sessions that are actually running right now.
+
+    `~/.claude/sessions/<pid>.json` is left behind by crashed runs, so a pid
+    alone proves nothing. The record's `procStart` is the process's start
+    time in clock ticks; matching it against /proc makes the check immune to
+    pid reuse.
+    """
+    sessions_dir = claude_config_dir() / "sessions"
+    live = []
+    try:
+        entries = sorted(sessions_dir.glob("*.json"))
+    except OSError:
+        return live
+
+    for path in entries:
+        record = load_json(path, None)
+        if not isinstance(record, dict):
+            continue
+        try:
+            pid = int(record.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        expected = record.get("procStart")
+        actual = process_start_ticks(pid)
+        if actual is None:
+            continue
+        if expected is not None and str(expected) != str(actual):
+            continue  # stale record, pid has been reused
+        live.append({
+            "pid": pid,
+            "status": str(record.get("status") or "unknown"),
+            "name": str(record.get("name") or ""),
+            "cwd": str(record.get("cwd") or ""),
+            "sessionId": str(record.get("sessionId") or ""),
+        })
+    return live
+
+
+def activity() -> dict:
+    """Whether it is safe to move the credential out from under the CLI.
+
+    A *busy* session is mid-request and would fail outright. An *idle* one
+    still holds the account open and will refresh the token on its own
+    schedule, which would strand the copy we just filed away -- so any live
+    session blocks the switch, and the reason says which case it is.
+    """
+    sessions = live_sessions()
+    busy = [s for s in sessions if s["status"] == "busy"]
+    if busy:
+        names = ", ".join(s["name"] or f"pid {s['pid']}" for s in busy[:3])
+        reason = f"Claude is working ({names})"
+    elif sessions:
+        names = ", ".join(s["name"] or f"pid {s['pid']}" for s in sessions[:3])
+        reason = f"Claude is running ({names})"
+    else:
+        reason = ""
+    return {
+        "busy": bool(busy),
+        "running": bool(sessions),
+        "canSwitch": not sessions,
+        "reason": reason,
+        "sessions": sessions,
+    }
+
+
+# ------------------------------------------------------------------ registry
+
+
+def load_registry() -> dict:
+    data = load_json(registry_path(), None)
+    if not isinstance(data, dict):
+        data = {}
+    accounts = data.get("accounts")
+    if not isinstance(accounts, list):
+        accounts = []
+    cleaned = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        cleaned.append({
+            "label": label,
+            "dir": str(item.get("dir") or (state_root() / label)),
+            "email": str(item.get("email") or ""),
+            "accountUuid": str(item.get("accountUuid") or ""),
+            "organizationName": str(item.get("organizationName") or ""),
+            "addedAt": str(item.get("addedAt") or ""),
+        })
+    return {"schemaVersion": SCHEMA_VERSION, "accounts": cleaned}
+
+
+def save_registry(registry: dict) -> None:
+    path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+    with os.fdopen(handle, "w") as stream:
+        json.dump(registry, stream, indent=2)
+        stream.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def find_account(registry: dict, label: str) -> dict | None:
+    for account in registry["accounts"]:
+        if account["label"] == label:
+            return account
+    return None
+
+
+def valid_label(label: str) -> bool:
+    return bool(label) and all(c.isalnum() or c in "._-" for c in label) and len(label) <= 64
+
+
+# ------------------------------------------------------------------ identity
+
+
+IDENTITY_FIELDS = ("accountUuid", "emailAddress", "organizationUuid", "organizationName")
+
+
+def read_oauth_account(path: Path) -> dict | None:
+    data = load_json(path, None)
+    if not isinstance(data, dict):
+        return None
+    account = data.get("oauthAccount")
+    return account if isinstance(account, dict) else None
+
+
+def write_oauth_account(path: Path, account: dict | None) -> None:
+    """Swap only `oauthAccount`, preserving everything else in the file.
+
+    `.claude.json` also carries project history, MCP approvals and onboarding
+    state, none of which belongs to the account being switched.
+    """
+    data = load_json(path, None)
+    if not isinstance(data, dict):
+        data = {}
+    if account is None:
+        data.pop("oauthAccount", None)
+    else:
+        data["oauthAccount"] = account
+    write_private(path, json.dumps(data, indent=2) + "\n")
+
+
+def account_identity_path(account: dict) -> Path:
+    return Path(account["dir"]) / ".claude.json"
+
+
+def describe_identity(account: dict | None) -> dict:
+    if not account:
+        return {}
+    return {key: account.get(key, "") for key in IDENTITY_FIELDS if account.get(key)}
+
+
+def active_label(registry: dict) -> str:
+    """Which registered account owns the live default credential.
+
+    Matched on `accountUuid`, never on the label alone: the identity marker is
+    the only thing that survives a login performed outside this tool.
+    """
+    if not default_credentials_path().exists():
+        return ""
+    identity = read_oauth_account(claude_json_path())
+    if not identity:
+        return ""
+    uuid = str(identity.get("accountUuid") or "")
+    if not uuid:
+        return ""
+    for account in registry["accounts"]:
+        if account["accountUuid"] and account["accountUuid"] == uuid:
+            return account["label"]
+    return ""
+
+
+# ------------------------------------------------------------------ backups
+
+
+def make_backup(tag: str) -> str:
+    """Archive the credential and identity a switch is about to overwrite."""
+    directory = secure_dir(backups_dir())
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.tar"
+    path = directory / name
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(handle, "wb") as raw:
+        with tarfile.open(fileobj=raw, mode="w") as archive:
+            for source, arcname in (
+                (default_credentials_path(), "credentials.json"),
+                (claude_json_path(), "claude.json"),
+            ):
+                if source.exists():
+                    archive.add(source, arcname=arcname)
+
+    archives = sorted(directory.glob("*.tar"))
+    for stale in archives[:-BACKUP_RETENTION]:
+        stale.unlink(missing_ok=True)
+    return str(path)
+
+
+# ------------------------------------------------------------------ commands
+
+
+def account_view(registry: dict, label_active: str, account: dict) -> dict:
+    try:
+        stored = keyring_lookup(account["label"]) is not None
+    except KeyringError:
+        stored = False
+    is_active = account["label"] == label_active
+    return {
+        "label": account["label"],
+        "active": is_active,
+        "email": account["email"],
+        "organizationName": account["organizationName"],
+        "accountUuid": account["accountUuid"],
+        "dir": account["dir"],
+        # An account is switchable when its credential is somewhere we can
+        # reach: the keyring for an inactive one, the live slot for the
+        # active one.
+        "ready": is_active or stored,
+        "storedInKeyring": stored,
+    }
+
+
+def build_status() -> dict:
+    registry = load_registry()
+    label_active = active_label(registry)
+    identity = read_oauth_account(claude_json_path()) or {}
+    keyring_ok, keyring_message = keyring_available()
+    accounts = [account_view(registry, label_active, a) for a in registry["accounts"]]
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "accounts": accounts,
+        "activeLabel": label_active,
+        "activeIdentity": describe_identity(identity),
+        # A login made with plain `claude` before any account was registered.
+        # It is real and usable; it just has no label to switch back to yet.
+        "unmanagedActive": bool(identity) and not label_active,
+        "hasDefaultCredential": default_credentials_path().exists(),
+        "keyringAvailable": keyring_ok,
+        "keyringMessage": keyring_message,
+        "activity": activity(),
+    }
+
+
+def cmd_status(args) -> int:
+    status = build_status()
+    if args.json:
+        json.dump(status, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+
+    if not status["keyringAvailable"]:
+        print(f"keyring: {status['keyringMessage']}")
+    identity = status["activeIdentity"]
+    active = status["activeLabel"] or ("(unregistered login)" if identity else "(signed out)")
+    print(f"Active: {active}")
+    if identity:
+        detail = identity.get("emailAddress", "")
+        org = identity.get("organizationName", "")
+        print(f"        {detail}{f'  ·  {org}' if org else ''}")
+
+    act = status["activity"]
+    print(f"Switch: {'available' if act['canSwitch'] else 'blocked — ' + act['reason']}")
+
+    if not status["accounts"]:
+        print("\nNo accounts registered. Add one with:\n  omarchy-claude-account add <label>")
+        return 0
+
+    print("\nAccounts:")
+    for account in status["accounts"]:
+        mark = "*" if account["active"] else " "
+        state = "active" if account["active"] else ("keyring" if account["storedInKeyring"] else "no credential")
+        print(f"  {mark} {account['label']:<16} {state:<14} {account['email']}")
+    return 0
+
+
+def cmd_list(args) -> int:
+    return cmd_status(args)
+
+
+def capture_into_keyring(label: str, credentials: Path, identity_source: Path,
+                         identity_target: Path) -> None:
+    """File a credential away under its label and keep its identity marker."""
+    blob = read_text_or_none(credentials)
+    if blob is None:
+        raise RuntimeError(f"no credential to capture at {credentials}")
+    keyring_store(label, blob)
+    identity = read_oauth_account(identity_source)
+    if identity is not None:
+        secure_dir(identity_target.parent)
+        write_oauth_account(identity_target, identity)
+
+
+def cmd_add(args) -> int:
+    label = args.label
+    if not valid_label(label):
+        print(f"invalid label {label!r}: use letters, digits, '.', '_' or '-'", file=sys.stderr)
+        return 2
+
+    ok, message = keyring_available()
+    if not ok:
+        print(message, file=sys.stderr)
+        return 1
+
+    registry = load_registry()
+    if find_account(registry, label) and not args.relogin:
+        print(f"{label!r} is already registered. Re-run with --relogin to sign in again.",
+              file=sys.stderr)
+        return 2
+
+    account_dir = secure_dir(state_root() / label)
+
+    if not args.no_login:
+        print(f"Opening `claude` with CLAUDE_CONFIG_DIR={account_dir}.")
+        print("Your current login is untouched. Sign in, then exit `claude`.\n")
+        environment = dict(os.environ, CLAUDE_CONFIG_DIR=str(account_dir))
+        # An isolated login must not inherit a key that would satisfy auth
+        # without ever writing the credential we are here to capture.
+        for variable in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            environment.pop(variable, None)
+        try:
+            subprocess.run(["claude", "/login"], env=environment, check=False)
+        except FileNotFoundError:
+            print("`claude` is not on PATH.", file=sys.stderr)
+            return 1
+
+    scoped_credentials = account_dir / ".credentials.json"
+
+    if args.no_login:
+        # Register the slot without a credential. The account shows up in the
+        # panel straight away, disabled and saying what it still needs, which
+        # is a clearer starting point than not existing at all.
+        registry = load_registry()
+        if not find_account(registry, label):
+            registry["accounts"].append({
+                "label": label, "dir": str(account_dir), "email": "",
+                "accountUuid": "", "organizationName": "",
+                "addedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            })
+            save_registry(registry)
+        print(f"Registered {label!r} with no credential yet. Sign it in with:\n"
+              f"  omarchy-claude-account add {label} --relogin")
+        return 0
+
+    if not scoped_credentials.exists():
+        print(f"No credential appeared at {scoped_credentials}; nothing was registered.",
+              file=sys.stderr)
+        return 1
+
+    identity = read_oauth_account(account_dir.parent.parent / ".claude.json")
+    # A scoped run writes its own `.claude.json` next to the config dir.
+    scoped_identity = account_dir.parent / f"{label}.claude.json"
+    for candidate in (account_dir / ".claude.json", scoped_identity):
+        found = read_oauth_account(candidate)
+        if found:
+            identity = found
+            break
+
+    try:
+        keyring_store(label, scoped_credentials.read_text())
+    except KeyringError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    # The plaintext copy has served its purpose: the keyring holds it now.
+    scoped_credentials.unlink(missing_ok=True)
+    if identity:
+        write_oauth_account(account_dir / ".claude.json", identity)
+
+    entry = find_account(registry, label) or {"label": label, "addedAt": ""}
+    entry.update({
+        "dir": str(account_dir),
+        "email": str((identity or {}).get("emailAddress") or entry.get("email", "")),
+        "accountUuid": str((identity or {}).get("accountUuid") or entry.get("accountUuid", "")),
+        "organizationName": str((identity or {}).get("organizationName")
+                                or entry.get("organizationName", "")),
+        "addedAt": entry.get("addedAt") or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    if not find_account(registry, label):
+        registry["accounts"].append(entry)
+    save_registry(registry)
+
+    print(f"\nRegistered {label!r}. Switch to it with:\n  omarchy-claude-account switch {label}")
+    return 0
+
+
+def cmd_adopt(args) -> int:
+    """Register the login that is already active, without a second sign-in.
+
+    The first account is nearly always one you are already signed into; making
+    you log in again just to give it a name would throw away a working
+    credential for nothing.
+    """
+    label = args.label
+    if not valid_label(label):
+        print(f"invalid label {label!r}", file=sys.stderr)
+        return 2
+
+    if not default_credentials_path().exists():
+        print("There is no active login to adopt.", file=sys.stderr)
+        return 1
+
+    registry = load_registry()
+    if find_account(registry, label):
+        print(f"{label!r} is already registered.", file=sys.stderr)
+        return 2
+
+    identity = read_oauth_account(claude_json_path()) or {}
+    account_dir = secure_dir(state_root() / label)
+    if identity:
+        write_oauth_account(account_dir / ".claude.json", identity)
+
+    # The credential stays exactly where it is: this account is the active
+    # one, and the active slot is where an active credential belongs.
+    registry["accounts"].append({
+        "label": label,
+        "dir": str(account_dir),
+        "email": str(identity.get("emailAddress") or ""),
+        "accountUuid": str(identity.get("accountUuid") or ""),
+        "organizationName": str(identity.get("organizationName") or ""),
+        "addedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    save_registry(registry)
+    print(f"Adopted the active login as {label!r}.")
+    return 0
+
+
+def cmd_switch(args) -> int:
+    label = args.label
+    registry = load_registry()
+    target = find_account(registry, label)
+
+    def fail(message: str, code: int = 1) -> int:
+        if args.json:
+            json.dump({"ok": False, "error": message}, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print(message, file=sys.stderr)
+        return code
+
+    if not target:
+        labels = ", ".join(a["label"] for a in registry["accounts"]) or "none registered"
+        return fail(f"unknown account {label!r} (known: {labels})", 2)
+
+    # Asked for the account that is already live: nothing moves, so a running
+    # session is irrelevant. Checking busyness first would refuse a no-op.
+    current = active_label(registry)
+    if current == label:
+        if args.json:
+            json.dump({"ok": True, "unchanged": True, "activeLabel": label}, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print(f"{label!r} is already active.")
+        return 0
+
+    act = activity()
+    if not act["canSwitch"] and not args.force:
+        return fail(f"refusing to switch: {act['reason']}. "
+                    f"Exit the running `claude` session first.")
+
+    try:
+        incoming = keyring_lookup(label)
+    except KeyringError as error:
+        return fail(str(error))
+    if incoming is None:
+        return fail(f"{label!r} has no stored credential. "
+                    f"Sign it in with: omarchy-claude-account add {label} --relogin")
+
+    default_credentials = default_credentials_path()
+    identity_path = claude_json_path()
+
+    # An active login that belongs to no registered account cannot be filed
+    # away, and installing over it would destroy it. Upstream stops here too.
+    if default_credentials.exists() and not current and not args.force:
+        return fail("the active `claude` login is not registered with any account, so it "
+                    "cannot be saved before being replaced. Give it a label first:\n"
+                    "  omarchy-claude-account adopt <label>\n"
+                    "or re-run with --force to discard it.")
+
+    if args.dry_run:
+        plan = {
+            "ok": True, "dryRun": True,
+            "from": current or ("(unregistered)" if default_credentials.exists() else "(none)"),
+            "to": label,
+        }
+        if args.json:
+            json.dump(plan, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print(f"Would switch {plan['from']} -> {plan['to']}")
+        return 0
+
+    backup = make_backup(current or "unmanaged")
+
+    try:
+        # 1. File the outgoing credential away under its own label, so its
+        #    lineage survives and only one copy is ever live.
+        if current and default_credentials.exists():
+            outgoing = find_account(registry, current)
+            capture_into_keyring(
+                current, default_credentials, identity_path,
+                account_identity_path(outgoing),
+            )
+
+        # 2. Install the incoming credential in the one default slot.
+        write_private(default_credentials, incoming)
+
+        # 3. Point the identity marker at the account now holding the slot.
+        incoming_identity = read_oauth_account(account_identity_path(target))
+        if incoming_identity:
+            write_oauth_account(identity_path, incoming_identity)
+
+        # 4. The keyring copy is no longer the live one; drop it so the
+        #    rotating token exists in exactly one place.
+        keyring_clear(label)
+    except Exception as error:  # noqa: BLE001 - reported, with the archive to recover from
+        return fail(f"switch failed: {error}. Roll back from {backup}")
+
+    if incoming_identity:
+        for key, field in (("emailAddress", "email"), ("accountUuid", "accountUuid"),
+                           ("organizationName", "organizationName")):
+            if incoming_identity.get(key):
+                target[field] = str(incoming_identity[key])
+        save_registry(registry)
+
+    if args.json:
+        json.dump({"ok": True, "activeLabel": label, "previousLabel": current,
+                   "backup": backup}, sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        print(f"Switched to {label!r}." + (f" Previous: {current}." if current else ""))
+    return 0
+
+
+def cmd_forget(args) -> int:
+    label = args.label
+    registry = load_registry()
+    account = find_account(registry, label)
+    if not account:
+        print(f"unknown account {label!r}", file=sys.stderr)
+        return 2
+    if active_label(registry) == label:
+        print(f"{label!r} is the active login; switch away before forgetting it.",
+              file=sys.stderr)
+        return 2
+
+    keyring_clear(label)
+    shutil.rmtree(account["dir"], ignore_errors=True)
+    registry["accounts"] = [a for a in registry["accounts"] if a["label"] != label]
+    save_registry(registry)
+    print(f"Forgot {label!r} and removed its stored credential.")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="omarchy-claude-account",
+        description="Switch which Claude account the `claude` CLI is signed into.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    status = sub.add_parser("status", help="show the active account and every registered one")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    listing = sub.add_parser("list", help="alias for status")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_list)
+
+    add = sub.add_parser("add", help="register an account and sign it in")
+    add.add_argument("label")
+    add.add_argument("--no-login", action="store_true",
+                     help="register without opening `claude`")
+    add.add_argument("--relogin", action="store_true",
+                     help="sign an already-registered account in again")
+    add.set_defaults(func=cmd_add)
+
+    adopt = sub.add_parser("adopt", help="register the login that is already active")
+    adopt.add_argument("label")
+    adopt.set_defaults(func=cmd_adopt)
+
+    switch = sub.add_parser("switch", help="make LABEL the active `claude` login")
+    switch.add_argument("label")
+    switch.add_argument("--json", action="store_true")
+    switch.add_argument("--dry-run", action="store_true")
+    switch.add_argument("--force", action="store_true",
+                        help="switch despite a running session or an unregistered login")
+    switch.set_defaults(func=cmd_switch)
+
+    forget = sub.add_parser("forget", help="remove an account and its stored credential")
+    forget.add_argument("label")
+    forget.set_defaults(func=cmd_forget)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except KeyringError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

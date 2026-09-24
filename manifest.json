@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "id": "cbrompton.ai-agents",
+  "name": "AI Agents",
+  "version": "1.0.0",
+  "author": "cbrompton",
+  "license": "MIT",
+  "description": "Token history, pace detail, and Claude account switching in one bar panel. Merges Omarchy's agent usage collectors with ai-usagebar; both are optional.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Agents",
+    "description": "Rate-limit meters with pace, tokens by day and by model, and a switch for which Claude account the CLI is signed into.",
+    "category": "AI",
+    "aliases": ["ai-agents", "agents", "usage", "claude-account"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "providers": {
+        "claude": { "enabled": true },
+        "codex": { "enabled": true },
+        "fireworks": { "enabled": true }
+      },
+      "refreshIntervalSec": 900,
+      "showValue": true,
+      "showProvider": false,
+      "showAll": false,
+      "barWindow": "auto",
+      "accountSwitch": true,
+      "syncMode": "Off",
+      "syncDir": "",
+      "syncFileName": "",
+      "syncDeviceId": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      },
+      {
+        "key": "showValue",
+        "type": "boolean",
+        "label": "Show usage value",
+        "description": "Show the selected provider's percentage or balance next to its mark in the top bar.",
+        "defaultValue": true
+      },
+      {
+        "key": "showProvider",
+        "type": "boolean",
+        "label": "Show provider name",
+        "description": "Prefix the bar value with the provider's short code (cld, gpt, zai). Off by default.",
+        "defaultValue": false
+      },
+      {
+        "key": "showAll",
+        "type": "boolean",
+        "label": "Show all providers",
+        "description": "Show every provider's mark and usage in the top bar at once, instead of one at a time.",
+        "defaultValue": false
+      },
+      {
+        "key": "barWindow",
+        "type": "enum",
+        "label": "Top bar usage window",
+        "description": "Which quota window the top bar shows. Auto keeps the fullest; the others pin a window and fall back to the fullest where a provider lacks it.",
+        "options": ["auto", "session", "weekly", "monthly"],
+        "defaultValue": "auto"
+      },
+      {
+        "key": "accountSwitch",
+        "type": "boolean",
+        "label": "Claude account switching",
+        "description": "Show the account switch in the panel. It is disabled automatically while a Claude session is running.",
+        "defaultValue": true
+      },
+      {
+        "key": "syncMode",
+        "type": "enum",
+        "label": "Synced aggregation",
+        "options": ["Off", "On"],
+        "defaultValue": "Off",
+        "description": "When On, write this machine's local usage snapshot and merge snapshots from other machines."
+      },
+      {
+        "key": "syncDir",
+        "type": "path",
+        "label": "Sync folder",
+        "defaultValue": "",
+        "description": "A folder synced by Syncthing, Dropbox, rsync, etc."
+      },
+      {
+        "key": "syncFileName",
+        "type": "string",
+        "label": "Snapshot file name",
+        "defaultValue": "",
+        "description": "Optional. Defaults to <hostname>.json."
+      },
+      {
+        "key": "syncDeviceId",
+        "type": "string",
+        "label": "Device id",
+        "defaultValue": "",
+        "description": "Optional stable device name used inside synced aggregate snapshots."
+      }
+    ]
+  }
+}
