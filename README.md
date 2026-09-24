@@ -120,10 +120,56 @@ stored credential yet, a locked keyring, or an active login with no label (that
 last one is refused because it could not be saved before being replaced —
 `adopt` it first, or `--force` to discard it).
 
-### Commands
+### Setting up accounts
 
-The helper lives in `bin/` here; the panel calls it from there. The
-commands below assume you linked it onto your PATH (see Install).
+Accounts are registered from a terminal; the panel only switches between them.
+The commands below assume you linked the helper onto your PATH (see Install).
+If you didn't, use the full path:
+`~/.config/omarchy/plugins/cbrompton.ai-agents/bin/omarchy-claude-account`.
+
+Labels can use letters, digits, `.`, `_` and `-`.
+
+**1. Adopt the account you're already signed into.** Until it has a label, the
+switch is disabled: an unnamed login can't be saved before it's replaced.
+
+```bash
+omarchy-claude-account adopt work
+```
+
+This doesn't sign you in again or move anything. It records the label and the
+account's identity (email, org) under
+`~/.local/share/omarchy/claude-accounts/work/`, and the credential stays where
+`claude` keeps it.
+
+**2. Add a second account.**
+
+```bash
+omarchy-claude-account add personal
+```
+
+This opens `claude` in a separate config directory, so your current login is
+not touched. Run through `/login` with the other account in the browser, then
+exit `claude` (`/exit` or Ctrl+D). The new credential goes straight into the
+keyring and the plaintext copy is deleted. If the keyring is locked or
+`secret-tool` is missing, it stops before opening `claude`.
+
+If `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set in your shell, it is
+ignored during this sign-in, so the login actually writes a credential.
+
+**3. Check, then switch.**
+
+```bash
+omarchy-claude-account status
+omarchy-claude-account switch personal
+```
+
+Or open the panel and click the account, or press `a` to cycle. Close every
+`claude` session first; the switch is disabled while one is running.
+
+To sign an existing label in again (a revoked or expired login), use
+`omarchy-claude-account add personal --relogin`.
+
+### Commands
 
 ```bash
 omarchy-claude-account status              # who is active, what is switchable
